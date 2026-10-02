@@ -1,7 +1,6 @@
-python-telegram-bot==20.7
+Flask
 requests
 pandas
 mplfinance
-google-generativeai
-pytz
-flask
+python-telegram-bot>=20,<23
+google-genai
