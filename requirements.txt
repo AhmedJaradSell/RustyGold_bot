@@ -4,3 +4,4 @@ pandas
 mplfinance
 google-generativeai
 pytz
+flask
