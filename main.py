@@ -3,6 +3,7 @@ import re
 import io
 import asyncio
 import threading
+
 from concurrent.futures import ThreadPoolExecutor
 
 import requests
@@ -10,6 +11,7 @@ import pandas as pd
 import mplfinance as mpf
 
 from flask import Flask
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -22,7 +24,7 @@ from google import genai
 
 
 # =========================================================
-# CONFIG
+# ENVIRONMENT
 # =========================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -31,12 +33,98 @@ GEMINI_KEY = os.getenv("GEMINI_KEY")
 
 SYMBOL = "XAU/USD"
 
-app = Flask(__name__)
+if not TELEGRAM_TOKEN or not TWELVEDATA_KEY or not GEMINI_KEY:
+    missing = []
 
-# One background task per Telegram chat
+    if not TELEGRAM_TOKEN:
+        missing.append("TELEGRAM_TOKEN")
+
+    if not TWELVEDATA_KEY:
+        missing.append("TWELVEDATA_KEY")
+
+    if not GEMINI_KEY:
+        missing.append("GEMINI_KEY")
+
+    raise RuntimeError(
+        "Missing environment variables: " + ", ".join(missing)
+    )
+
+
+# =========================================================
+# GEMINI
+# =========================================================
+
+gemini_client = genai.Client(api_key=GEMINI_KEY)
+
+gemini_models = []
+
+
+def load_gemini_models():
+    """
+    Find available Gemini models that support generateContent.
+    """
+
+    global gemini_models
+
+    models = []
+
+    try:
+        available = gemini_client.models.list()
+
+        for model in available:
+
+            name = getattr(model, "name", "")
+
+            if not name:
+                continue
+
+            actions = getattr(model, "supported_actions", [])
+
+            if actions and "generateContent" not in actions:
+                continue
+
+            if "gemini" not in name.lower():
+                continue
+
+            models.append(name)
+
+        # Prefer Flash models because they are generally faster.
+        models.sort(
+            key=lambda x: (
+                "flash" not in x.lower(),
+                x.lower(),
+            )
+        )
+
+        gemini_models = models
+
+        print("Available Gemini models:")
+
+        for model in gemini_models:
+            print(" -", model)
+
+    except Exception as e:
+
+        print("Failed to load Gemini models:", e)
+        gemini_models = []
+
+
+load_gemini_models()
+
+
+# =========================================================
+# THREAD POOL
+# =========================================================
+
+executor = ThreadPoolExecutor(max_workers=4)
+
+
+# =========================================================
+# BOT STATE
+# =========================================================
+
 tasks = {}
 
-# Trading statistics
 stats = {
     "wins": 0,
     "losses": 0,
@@ -44,213 +132,227 @@ stats = {
     "pnl": 0.0,
 }
 
-# Gemini client
-gemini_client = genai.Client(api_key=GEMINI_KEY)
-
-AVAILABLE_GEMINI_MODELS = []
-
-# Used for blocking HTTP/API requests without freezing asyncio
-executor = ThreadPoolExecutor(max_workers=4)
-
 
 # =========================================================
 # ICT PROMPT
 # =========================================================
 
 ICT_PROMPT = """
-أنت محلل تداول متخصص في ICT وPrice Action.
+أنت محلل XAU/USD متخصص في ICT وPrice Action.
 
-أمامك صورتان لشارت XAU/USD:
+لديك أربعة مصادر للمعلومات:
 
-1) فريم 1 دقيقة
-2) فريم 5 دقائق
+1. بيانات OHLC دقيقة لفريم 5m.
+2. بيانات OHLC دقيقة لفريم 1m.
+3. صورة شارت 5m.
+4. صورة شارت 1m.
+5. السعر الحالي.
 
-ولديك السعر الحقيقي الحالي.
+استخدم بيانات OHLC كأساس أساسي لتحديد المستويات والأسعار الدقيقة.
 
-مهمتك البحث عن SETUP حقيقي وليس انتظار وجود جميع عناصر ICT في نفس الوقت.
+استخدم صور الشارت لفهم السياق البصري والبنية العامة.
 
-========================
-طريقة التحليل
-========================
-
-أولًا:
-
-حدد اتجاه وبنية السوق على فريم 5 دقائق:
-
-- صاعد
-- هابط
-- أو متذبذب/غير واضح
-
-ابحث عن:
-- Higher High / Higher Low
-- Lower High / Lower Low
-- BOS
-- CHoCH
-- مناطق السيولة
-
-ثم استخدم فريم 1 دقيقة للبحث عن دخول يتوافق مع اتجاه 5 دقائق قدر الإمكان.
+لا تعتمد على الصورة وحدها إذا تعارضت مع أرقام OHLC.
 
 ========================
-عناصر ICT
+الخطوة 1 — 5M STRUCTURE
 ========================
 
-ابحث عن:
-
-- BOS
-- CHoCH
-- Liquidity Sweep
-- FVG
-- Order Block
-- Displacement
-- Previous High / Previous Low
-- Equal Highs / Equal Lows
-- مناطق السيولة القريبة
-
-لكن انتبه:
-
-لا يشترط وجود جميع هذه العناصر.
-
-يمكن اعتبار الصفقة صالحة إذا وجدت مجموعة منطقية من الأدلة، مثل:
-
-1) اتجاه واضح + BOS + FVG
-
-أو:
-
-2) اتجاه واضح + Liquidity Sweep + CHoCH
-
-أو:
-
-3) اتجاه واضح + Sweep + FVG
-
-أو:
-
-4) اتجاه واضح + Order Block + displacement
-
-أو أي تركيبة مشابهة لها منطق واضح.
-
-لا تبحث عن الكمال.
-
-========================
-الدخول
-========================
-
-إذا وجدت Setup واضحًا:
+حلل فريم 5m أولاً.
 
 حدد:
 
-ENTRY
-SL
-TP1
+- HH
+- HL
+- LH
+- LL
+- BOS
+- CHoCH
+- الاتجاه
+- أو Range / تذبذب
 
-ENTRY يمكن أن يكون:
-
-- السعر الحالي
-- أو منطقة إعادة اختبار FVG
-- أو منطقة Order Block
-- أو مستوى كسر/إعادة اختبار واضح
-
-SL يجب أن يكون خلف منطقة إبطال الفكرة:
-
-في BUY:
-أسفل القاع/منطقة الإبطال.
-
-في SELL:
-أعلى القمة/منطقة الإبطال.
-
-TP1 يكون عند أقرب هدف منطقي للسيولة أو القمة/القاع المقابل.
-
-لا تضع أرقامًا عشوائية.
+حدد آخر بنية واضحة قبل السعر الحالي.
 
 ========================
-مهم جدًا
+الخطوة 2 — LIQUIDITY
 ========================
 
-لا تقل NO TRADE لمجرد أن أحد عناصر ICT غير موجود.
+ابحث عن:
 
-قل NO TRADE فقط عندما:
+- Previous High
+- Previous Low
+- Equal Highs
+- Equal Lows
+- Buy-side liquidity
+- Sell-side liquidity
+- Liquidity Sweep
 
-- الاتجاه غير واضح جدًا
-- أو لا توجد بنية قابلة للتداول
-- أو لا توجد منطقة دخول منطقية
-- أو SL/TP لا يمكن تحديدهما بشكل منطقي
+إذا حدث Sweep، حدد المستوى السعري الذي تم أخذه.
 
-إذا كانت هناك فرصة معقولة وواضحة، أعطِ الصفقة.
+لا تعتبر مجرد لمس مستوى Sweep مؤكداً.
+
+========================
+الخطوة 3 — 1M CONFIRMATION
+========================
+
+بعد تحديد اتجاه 5m، انتقل إلى 1m.
+
+ابحث عن:
+
+- BOS
+- CHoCH
+- Displacement
+- FVG
+- Order Block
+- Retest
+
+لا تشترط وجود جميع عناصر ICT.
+
+يكفي وجود مجموعة متوافقة ومنطقية مثل:
+
+Structure + Liquidity + Confirmation
+
+========================
+الخطوة 4 — الاتجاه
+========================
+
+لا تدخل ضد اتجاه 5m إلا إذا ظهر على 1m تغير واضح في البنية بعد Liquidity Sweep.
+
+إذا كان السوق متذبذباً وغير واضح:
+
+NO TRADE
+
+========================
+الخطوة 5 — ENTRY
+========================
+
+حدد ENTRY من مستوى سعري حقيقي موجود في بيانات OHLC.
+
+لا تخترع سعراً عشوائياً.
+
+إذا كان الدخول من Retest:
+
+حدد المستوى الذي يجب أن يعود إليه السعر.
+
+========================
+الخطوة 6 — STOP LOSS
+========================
+
+ضع SL خلف مستوى إبطال واضح.
+
+BUY:
+SL يجب أن يكون أسفل القاع أو منطقة الإبطال.
+
+SELL:
+SL يجب أن يكون أعلى القمة أو منطقة الإبطال.
+
+لا تضع SL عشوائياً.
+
+========================
+الخطوة 7 — TAKE PROFIT
+========================
+
+حدد TP1 عند أقرب:
+
+- Liquidity
+- Previous High/Low
+- Swing High/Low
+- أو هدف سعري منطقي تدعمه البيانات.
+
+========================
+التحقق النهائي
+========================
+
+قبل إرسال الصفقة تحقق من ترتيب الأسعار.
+
+BUY:
+
+SL < ENTRY < TP1
+
+SELL:
+
+TP1 < ENTRY < SL
+
+إذا لم يتحقق هذا الترتيب:
+
+NO TRADE
+
+========================
+قاعدة مهمة
+========================
+
+لا تجبر نفسك على إعطاء صفقة.
+
+إذا لم يكن هناك Setup واضح تدعمه البيانات:
+
+NO TRADE
 
 لا تخترع صفقة فقط لتجنب NO TRADE.
 
 ========================
-صيغة الإخراج
+الإخراج
 ========================
 
-إذا لم توجد فرصة:
-
-NO TRADE
-
-إذا وجدت فرصة:
+إذا وجدت صفقة:
 
 TRADE
 DIRECTION: BUY
-ENTRY: 3850.25
-SL: 3847.80
-TP1: 3855.00
+ENTRY: 0000.00
+SL: 0000.00
+TP1: 0000.00
+
+REASON:
+5M BIAS: ...
+LIQUIDITY: ...
+1M STRUCTURE: ...
+ENTRY: ...
 
 أو:
 
 TRADE
 DIRECTION: SELL
-ENTRY: 3850.25
-SL: 3853.00
-TP1: 3845.50
+ENTRY: 0000.00
+SL: 0000.00
+TP1: 0000.00
 
-بعد الأرقام اكتب شرحًا قصيرًا جدًا:
-
-BIAS: BUY/SELL
-STRUCTURE: ...
+REASON:
+5M BIAS: ...
 LIQUIDITY: ...
-ENTRY REASON: ...
-INVALIDATION: ...
+1M STRUCTURE: ...
+ENTRY: ...
 
-لا تكتب تحليلاً طويلًا.
+إذا لا توجد صفقة:
 
-السعر الحقيقي الحالي:
+NO TRADE
+REASON: ...
+
+========================
+CURRENT PRICE
+========================
+
+CURRENT PRICE:
 {price}
+
+========================
+5M OHLC DATA
+========================
+
+{ohlc_5m}
+
+========================
+1M OHLC DATA
+========================
+
+{ohlc_1m}
 """
-
-
-# =========================================================
-# TELEGRAM UI
-# =========================================================
-
-def main_keyboard():
-    return InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton(
-                    "🚀 حلل يا جيمني",
-                    callback_data="start_analysis",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "🛑 إيقاف",
-                    callback_data="stop",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "📊 ملخص",
-                    callback_data="summary",
-                )
-            ],
-        ]
-    )
 
 
 # =========================================================
 # TWELVEDATA
 # =========================================================
 
-def get_candles(interval, outputsize):
+def fetch_candles(interval, outputsize):
+
     url = "https://api.twelvedata.com/time_series"
 
     params = {
@@ -267,6 +369,8 @@ def get_candles(interval, outputsize):
         timeout=20,
     )
 
+    response.raise_for_status()
+
     data = response.json()
 
     if "values" not in data:
@@ -276,43 +380,42 @@ def get_candles(interval, outputsize):
 
     df = pd.DataFrame(data["values"])
 
-    df["datetime"] = pd.to_datetime(df["datetime"])
+    df["datetime"] = pd.to_datetime(
+        df["datetime"]
+    )
 
-    df = df.sort_values("datetime")
+    df = df.set_index("datetime")
 
-    df.set_index("datetime", inplace=True)
-
-    for column in ["open", "high", "low", "close"]:
+    for column in [
+        "open",
+        "high",
+        "low",
+        "close",
+    ]:
         df[column] = pd.to_numeric(
             df[column],
             errors="coerce",
         )
 
-    if "volume" in df.columns:
-        df["volume"] = pd.to_numeric(
-            df["volume"],
-            errors="coerce",
-        )
-
-    df.dropna(
-        subset=["open", "high", "low", "close"],
-        inplace=True,
-    )
+    df = df.sort_index()
 
     return df
 
 
 # =========================================================
-# LIVE GOLD PRICE
+# GOLD PRICE
 # =========================================================
 
-def get_live_gold_price():
+def fetch_gold_price():
+
     url = "https://api.gold-api.com/price/XAU"
 
     response = requests.get(
         url,
         timeout=15,
     )
+
+    response.raise_for_status()
 
     data = response.json()
 
@@ -327,10 +430,40 @@ def get_live_gold_price():
 
 
 # =========================================================
-# CHART RENDERING
+# OHLC FORMAT
 # =========================================================
 
-def make_chart(df, title):
+def dataframe_to_ohlc_text(df, max_rows):
+
+    recent = df.tail(max_rows)
+
+    lines = [
+        "datetime,open,high,low,close"
+    ]
+
+    for idx, row in recent.iterrows():
+
+        timestamp = idx.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+
+        lines.append(
+            f"{timestamp},"
+            f"{row['open']:.2f},"
+            f"{row['high']:.2f},"
+            f"{row['low']:.2f},"
+            f"{row['close']:.2f}"
+        )
+
+    return "\n".join(lines)
+
+
+# =========================================================
+# CHART
+# =========================================================
+
+def create_chart(df, title):
+
     chart_df = df.copy()
 
     chart_df.index.name = "Date"
@@ -341,10 +474,10 @@ def make_chart(df, title):
         chart_df,
         type="candle",
         style="charles",
+        title=title,
+        ylabel="XAU/USD",
         volume=False,
         figsize=(12, 6),
-        title=title,
-        tight_layout=True,
         savefig=dict(
             fname=buf,
             dpi=120,
@@ -358,120 +491,58 @@ def make_chart(df, title):
 
 
 # =========================================================
-# GEMINI MODEL DISCOVERY
-# =========================================================
-
-def get_available_gemini_models():
-    models = list(
-        gemini_client.models.list()
-    )
-
-    available = []
-
-    for model in models:
-        name = getattr(
-            model,
-            "name",
-            None,
-        )
-
-        actions = getattr(
-            model,
-            "supported_actions",
-            [],
-        ) or []
-
-        if not name:
-            continue
-
-        if "generateContent" not in actions:
-            continue
-
-        if "gemini" not in name.lower():
-            continue
-
-        available.append(name)
-
-    # Prefer flash models because they are generally more suitable
-    # for repeated analysis loops.
-    def model_priority(name):
-        name_lower = name.lower()
-
-        if "flash" in name_lower:
-            return 0
-
-        if "pro" in name_lower:
-            return 1
-
-        return 2
-
-    available.sort(
-        key=model_priority
-    )
-
-    return available
-
-
-def load_gemini_models():
-    global AVAILABLE_GEMINI_MODELS
-
-    try:
-        AVAILABLE_GEMINI_MODELS = (
-            get_available_gemini_models()
-        )
-
-        print(
-            "\n========== GEMINI MODELS =========="
-        )
-
-        if not AVAILABLE_GEMINI_MODELS:
-            print("No compatible Gemini models found.")
-
-        for model in AVAILABLE_GEMINI_MODELS:
-            print(model)
-
-        print(
-            "===================================\n"
-        )
-
-        return AVAILABLE_GEMINI_MODELS
-
-    except Exception as e:
-        print(
-            f"Gemini model discovery error: {e}"
-        )
-
-        AVAILABLE_GEMINI_MODELS = []
-
-        return []
-
-
-# =========================================================
 # GEMINI ANALYSIS
 # =========================================================
+
+def generate_gemini_content(
+    model_name,
+    prompt,
+    image_1m,
+    image_5m,
+):
+
+    contents = [
+        prompt,
+        {
+            "mime_type": "image/png",
+            "data": image_5m,
+        },
+        {
+            "mime_type": "image/png",
+            "data": image_1m,
+        },
+    ]
+
+    return gemini_client.models.generate_content(
+        model=model_name,
+        contents=contents,
+    )
+
 
 def analyze_with_gemini(
     price,
     image_1m,
     image_5m,
+    ohlc_1m,
+    ohlc_5m,
 ):
-    global AVAILABLE_GEMINI_MODELS
 
-    if not AVAILABLE_GEMINI_MODELS:
+    if not gemini_models:
         load_gemini_models()
 
-    if not AVAILABLE_GEMINI_MODELS:
-        raise RuntimeError(
-            "No Gemini models available."
+    if not gemini_models:
+        return (
+            "NO TRADE\n"
+            "REASON: No available Gemini model."
         )
 
     prompt = ICT_PROMPT.format(
-        price=f"{price:.2f}"
+        price=f"{price:.2f}",
+        ohlc_5m=ohlc_5m,
+        ohlc_1m=ohlc_1m,
     )
 
-    last_error = None
-
-    for model_name in AVAILABLE_GEMINI_MODELS:
+    for model_name in gemini_models:
 
         try:
 
@@ -479,25 +550,11 @@ def analyze_with_gemini(
                 f"Trying Gemini model: {model_name}"
             )
 
-            response = (
-                gemini_client.models.generate_content(
-                    model=model_name,
-                    contents=[
-                        prompt,
-                        {
-                            "inline_data": {
-                                "mime_type": "image/png",
-                                "data": image_1m,
-                            }
-                        },
-                        {
-                            "inline_data": {
-                                "mime_type": "image/png",
-                                "data": image_5m,
-                            }
-                        },
-                    ],
-                )
+            response = generate_gemini_content(
+                model_name,
+                prompt,
+                image_1m,
+                image_5m,
             )
 
             text = getattr(
@@ -506,29 +563,26 @@ def analyze_with_gemini(
                 None,
             )
 
-            if text and text.strip():
+            if text:
 
                 print(
                     f"Gemini success: {model_name}"
                 )
 
-                return (
-                    text.strip(),
-                    model_name,
-                )
+                print(text)
+
+                return text
 
         except Exception as e:
 
             print(
-                f"Gemini failed on {model_name}: {e}"
+                f"Gemini model failed "
+                f"{model_name}: {e}"
             )
 
-            last_error = e
-
-            continue
-
-    raise RuntimeError(
-        f"All Gemini models failed: {last_error}"
+    return (
+        "NO TRADE\n"
+        "REASON: All Gemini models failed."
     )
 
 
@@ -536,170 +590,73 @@ def analyze_with_gemini(
 # TRADE PARSER
 # =========================================================
 
-def extract_number(text):
-    """
-    Extract the first decimal number from text.
-    Handles commas and optional USD-like text.
-    """
+def extract_number(text, labels):
 
-    if not text:
-        return None
-
-    match = re.search(
-        r"[-+]?\d+(?:,\d{3})*(?:\.\d+)?",
-        text,
-    )
-
-    if not match:
-        return None
-
-    value = match.group(0)
-
-    value = value.replace(",", "")
-
-    try:
-        return float(value)
-    except ValueError:
-        return None
-
-
-def extract_field(text, field_names):
-    """
-    Extract a numeric value after one of several possible labels.
-
-    Examples accepted:
-
-    ENTRY: 3850.25
-    ENTRY = 3850.25
-    ENTRY 3850.25
-    Entry Price: 3850.25
-    BUY @ 3850.25
-    """
-
-    for field in field_names:
+    for label in labels:
 
         pattern = (
-            rf"{re.escape(field)}"
-            rf"\s*(?:PRICE)?"
-            rf"\s*[:=\\-]?\s*"
-            rf"([0-9][0-9,]*(?:\.[0-9]+)?)"
+            rf"{label}"
+            rf"\s*[:=]\s*"
+            rf"(\d+(?:\.\d+)?)"
         )
 
         match = re.search(
             pattern,
             text,
-            flags=re.IGNORECASE,
+            re.IGNORECASE,
         )
 
         if match:
-
-            value = (
-                match.group(1)
-                .replace(",", "")
-            )
-
-            try:
-                return float(value)
-            except ValueError:
-                pass
-
-    return None
-
-
-def parse_direction(text):
-    upper = text.upper()
-
-    buy_patterns = [
-        r"\bBUY\b",
-        r"\bLONG\b",
-    ]
-
-    sell_patterns = [
-        r"\bSELL\b",
-        r"\bSHORT\b",
-    ]
-
-    buy = any(
-        re.search(
-            pattern,
-            upper,
-        )
-        for pattern in buy_patterns
-    )
-
-    sell = any(
-        re.search(
-            pattern,
-            upper,
-        )
-        for pattern in sell_patterns
-    )
-
-    if buy and not sell:
-        return "BUY"
-
-    if sell and not buy:
-        return "SELL"
-
-    # If the model writes:
-    # BUY @ 3850
-    if re.search(
-        r"\bBUY\s*@",
-        upper,
-    ):
-        return "BUY"
-
-    if re.search(
-        r"\bSELL\s*@",
-        upper,
-    ):
-        return "SELL"
+            return float(match.group(1))
 
     return None
 
 
 def parse_trade(text):
-    """
-    Parse Gemini output into:
-
-    {
-        direction,
-        entry,
-        sl,
-        tp1
-    }
-
-    Returns None for NO TRADE or invalid setup.
-    """
 
     if not text:
         return None
 
     upper = text.upper()
 
-    # Explicit no-trade response
-    if re.search(
-        r"\bNO\s*TRADE\b",
-        upper,
-    ):
+    if "NO TRADE" in upper:
         return None
 
-    direction = parse_direction(
-        text
-    )
+    direction = None
 
-    # Standard labels
-    entry = extract_field(
-        text,
+    if re.search(
+        r"DIRECTION\s*[:=]\s*BUY",
+        upper,
+    ):
+        direction = "BUY"
+
+    elif re.search(
+        r"DIRECTION\s*[:=]\s*SELL",
+        upper,
+    ):
+        direction = "SELL"
+
+    else:
+
+        if re.search(r"\bBUY\b", upper):
+            direction = "BUY"
+
+        elif re.search(r"\bSELL\b", upper):
+            direction = "SELL"
+
+    if direction is None:
+        return None
+
+    entry = extract_number(
+        upper,
         [
             "ENTRY",
             "ENTRY PRICE",
-            "ENTRY LEVEL",
         ],
     )
 
-    sl = extract_field(
-        text,
+    sl = extract_number(
+        upper,
         [
             "SL",
             "STOP LOSS",
@@ -707,8 +664,8 @@ def parse_trade(text):
         ],
     )
 
-    tp1 = extract_field(
-        text,
+    tp1 = extract_number(
+        upper,
         [
             "TP1",
             "TP",
@@ -717,63 +674,38 @@ def parse_trade(text):
         ],
     )
 
-    # Fallback for BUY @ price / SELL @ price
-    if entry is None:
-
-        match = re.search(
-            r"\b(?:BUY|SELL|LONG|SHORT)"
-            r"\s*@\s*"
-            r"([0-9][0-9,]*(?:\.[0-9]+)?)",
-            upper,
-        )
-
-        if match:
-            entry = float(
-                match.group(1).replace(",", "")
-            )
-
     if (
-        direction is None
-        or entry is None
+        entry is None
         or sl is None
         or tp1 is None
     ):
         return None
 
-    # Basic numerical sanity checks
-    if entry <= 0 or sl <= 0 or tp1 <= 0:
-        return None
-
+    # Validate price ordering.
     if direction == "BUY":
 
-        # For BUY, SL must be below entry
-        # and TP1 must be above entry.
         if not (
             sl < entry < tp1
         ):
             print(
-                "Invalid BUY setup:",
+                "Invalid BUY ordering:",
                 entry,
                 sl,
                 tp1,
             )
-
             return None
 
     elif direction == "SELL":
 
-        # For SELL, TP1 must be below entry
-        # and SL must be above entry.
         if not (
             tp1 < entry < sl
         ):
             print(
-                "Invalid SELL setup:",
+                "Invalid SELL ordering:",
                 entry,
                 sl,
                 tp1,
             )
-
             return None
 
     return {
@@ -785,16 +717,148 @@ def parse_trade(text):
 
 
 # =========================================================
-# FORMAT TRADE
+# TELEGRAM MESSAGE
 # =========================================================
 
-def format_trade(trade):
-    return (
-        f"📌 {trade['direction']}\n"
-        f"ENTRY: {trade['entry']:.2f}\n"
-        f"SL: {trade['sl']:.2f}\n"
-        f"TP1: {trade['tp1']:.2f}"
+async def send_message(
+    context,
+    chat_id,
+    text,
+):
+
+    try:
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=text,
+        )
+
+    except Exception as e:
+
+        print(
+            "Telegram send error:",
+            e,
+        )
+
+
+# =========================================================
+# WAIT FOR ENTRY
+# =========================================================
+
+async def wait_for_entry(
+    context,
+    chat_id,
+    trade,
+):
+
+    entry = trade["entry"]
+
+    # Entry zone requested for simulation.
+    tolerance = 0.60
+
+    # Monitor for 5 minutes.
+    end_time = (
+        asyncio.get_running_loop().time()
+        + 300
     )
+
+    while (
+        asyncio.get_running_loop().time()
+        < end_time
+    ):
+
+        try:
+
+            price = await asyncio.to_thread(
+                fetch_gold_price
+            )
+
+            distance = abs(
+                price - entry
+            )
+
+            print(
+                f"Waiting entry | "
+                f"Price={price:.2f} "
+                f"Entry={entry:.2f} "
+                f"Distance={distance:.2f}"
+            )
+
+            if distance <= tolerance:
+
+                return price
+
+        except Exception as e:
+
+            print(
+                "Entry price error:",
+                e,
+            )
+
+        await asyncio.sleep(5)
+
+    return None
+
+
+# =========================================================
+# MONITOR TRADE
+# =========================================================
+
+async def monitor_trade(
+    context,
+    chat_id,
+    trade,
+):
+
+    direction = trade["direction"]
+    entry = trade["entry"]
+    sl = trade["sl"]
+    tp1 = trade["tp1"]
+
+    while True:
+
+        try:
+
+            price = await asyncio.to_thread(
+                fetch_gold_price
+            )
+
+            print(
+                f"Trade monitor | "
+                f"{direction} | "
+                f"Price={price:.2f} | "
+                f"SL={sl:.2f} | "
+                f"TP={tp1:.2f}"
+            )
+
+            if direction == "BUY":
+
+                if price <= sl:
+
+                    return "LOSS", price
+
+                if price >= tp1:
+
+                    return "WIN", price
+
+            elif direction == "SELL":
+
+                if price >= sl:
+
+                    return "LOSS", price
+
+                if price <= tp1:
+
+                    return "WIN", price
+
+        except Exception as e:
+
+            print(
+                "Trade monitor error:",
+                e,
+            )
+
+        await asyncio.sleep(5)
 
 
 # =========================================================
@@ -802,442 +866,271 @@ def format_trade(trade):
 # =========================================================
 
 async def analysis_loop(
-    chat_id,
     context,
+    chat_id,
 ):
 
-    current_task = asyncio.current_task()
-
     print(
-        f"Analysis loop started for {chat_id}"
+        f"Started analysis loop for {chat_id}"
     )
 
-    try:
+    while True:
 
-        while True:
+        try:
 
-            print(
-                f"Starting new analysis for {chat_id}"
+            # -----------------------------------------
+            # FETCH DATA
+            # -----------------------------------------
+
+            df_1m = await asyncio.to_thread(
+                fetch_candles,
+                "1min",
+                60,
             )
 
-            # -------------------------------------------------
-            # Fetch market data
-            # -------------------------------------------------
-
-            loop = asyncio.get_running_loop()
-
-            try:
-
-                df_1m, df_5m, price = (
-                    await asyncio.gather(
-                        loop.run_in_executor(
-                            executor,
-                            get_candles,
-                            "1min",
-                            60,
-                        ),
-                        loop.run_in_executor(
-                            executor,
-                            get_candles,
-                            "5min",
-                            96,
-                        ),
-                        loop.run_in_executor(
-                            executor,
-                            get_live_gold_price,
-                        ),
-                    )
-                )
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception as e:
-
-                print(
-                    f"Market data error: {e}"
-                )
-
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "⚠️ تعذر جلب بيانات السوق.\n"
-                        "سيتم إعادة المحاولة بعد دقيقة."
-                    ),
-                )
-
-                await asyncio.sleep(60)
-
-                continue
-
-            # -------------------------------------------------
-            # Make charts
-            # -------------------------------------------------
-
-            try:
-
-                image_1m = await loop.run_in_executor(
-                    executor,
-                    make_chart,
-                    df_1m,
-                    "XAU/USD - 1 Minute",
-                )
-
-                image_5m = await loop.run_in_executor(
-                    executor,
-                    make_chart,
-                    df_5m,
-                    "XAU/USD - 5 Minute",
-                )
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception as e:
-
-                print(
-                    f"Chart error: {e}"
-                )
-
-                await asyncio.sleep(30)
-
-                continue
-
-            # -------------------------------------------------
-            # Send current market snapshot
-            # -------------------------------------------------
-
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "🔎 جاري تحليل XAU/USD...\n"
-                    f"السعر الحالي: {price:.2f}"
-                ),
+            df_5m = await asyncio.to_thread(
+                fetch_candles,
+                "5min",
+                96,
             )
 
-            # -------------------------------------------------
-            # Gemini
-            # -------------------------------------------------
-
-            try:
-
-                analysis, model_name = (
-                    await loop.run_in_executor(
-                        executor,
-                        analyze_with_gemini,
-                        price,
-                        image_1m,
-                        image_5m,
-                    )
-                )
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception as e:
-
-                print(
-                    f"Gemini analysis error: {e}"
-                )
-
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "⚠️ تعذر تحليل الشارت بواسطة Gemini.\n"
-                        "إعادة المحاولة بعد دقيقة."
-                    ),
-                )
-
-                await asyncio.sleep(60)
-
-                continue
-
-            print(
-                "\n========== GEMINI =========="
-            )
-            print(
-                f"MODEL: {model_name}"
-            )
-            print(analysis)
-            print(
-                "============================\n"
+            price = await asyncio.to_thread(
+                fetch_gold_price
             )
 
-            trade = parse_trade(
-                analysis
+            # -----------------------------------------
+            # CREATE CHARTS
+            # -----------------------------------------
+
+            image_1m = await asyncio.to_thread(
+                create_chart,
+                df_1m,
+                "XAU/USD - 1 Minute",
             )
 
-            # -------------------------------------------------
+            image_5m = await asyncio.to_thread(
+                create_chart,
+                df_5m,
+                "XAU/USD - 5 Minute",
+            )
+
+            # -----------------------------------------
+            # CREATE OHLC TEXT
+            # -----------------------------------------
+
+            # Send the latest 60 candles on 1m.
+            ohlc_1m = dataframe_to_ohlc_text(
+                df_1m,
+                60,
+            )
+
+            # Send the latest 48 candles on 5m.
+            # 48 candles = approximately 4 hours.
+            ohlc_5m = dataframe_to_ohlc_text(
+                df_5m,
+                48,
+            )
+
+            # -----------------------------------------
+            # GEMINI
+            # -----------------------------------------
+
+            result = await asyncio.to_thread(
+                analyze_with_gemini,
+                price,
+                image_1m,
+                image_5m,
+                ohlc_1m,
+                ohlc_5m,
+            )
+
+            trade = parse_trade(result)
+
+            # -----------------------------------------
             # NO TRADE
-            # -------------------------------------------------
+            # -----------------------------------------
 
             if trade is None:
 
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "⚪ NO TRADE\n\n"
-                        f"Gemini: {model_name}\n"
-                        f"السعر: {price:.2f}\n\n"
-                        "سيتم إعادة التحليل بعد 5 دقائق."
+                await send_message(
+                    context,
+                    chat_id,
+                    (
+                        "🔎 RustyGold\n\n"
+                        f"السعر الحالي: {price:.2f}\n\n"
+                        f"{result}"
                     ),
                 )
 
-                await asyncio.sleep(
-                    5 * 60
-                )
+                # Reanalyze after 5 minutes.
+                await asyncio.sleep(300)
 
                 continue
 
-            # -------------------------------------------------
+            # -----------------------------------------
             # TRADE FOUND
-            # -------------------------------------------------
+            # -----------------------------------------
 
-            stats["trades"] += 1
-
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "🚨 SETUP FOUND\n\n"
-                    + format_trade(trade)
-                    + "\n\n"
-                    f"Gemini: {model_name}\n"
-                    "سأراقب الوصول إلى منطقة الدخول."
-                ),
-            )
-
-            # -------------------------------------------------
-            # WAIT FOR ENTRY
-            # -------------------------------------------------
-
+            direction = trade["direction"]
             entry = trade["entry"]
             sl = trade["sl"]
             tp1 = trade["tp1"]
-            direction = trade["direction"]
 
-            entry_reached = False
+            await send_message(
+                context,
+                chat_id,
+                (
+                    "🚨 TRADE SETUP\n\n"
+                    f"Direction: {direction}\n"
+                    f"Entry: {entry:.2f}\n"
+                    f"SL: {sl:.2f}\n"
+                    f"TP1: {tp1:.2f}\n\n"
+                    f"{result}"
+                ),
+            )
 
-            # Maximum entry-wait time = 5 minutes
-            for _ in range(60):
+            # -----------------------------------------
+            # WAIT FOR ENTRY
+            # -----------------------------------------
 
-                await asyncio.sleep(5)
+            entry_price = await wait_for_entry(
+                context,
+                chat_id,
+                trade,
+            )
 
-                try:
+            if entry_price is None:
 
-                    current_price = (
-                        await loop.run_in_executor(
-                            executor,
-                            get_live_gold_price,
-                        )
-                    )
-
-                except asyncio.CancelledError:
-                    raise
-
-                except Exception:
-                    continue
-
-                # -------------------------------------------------
-                # Entry distance
-                # -------------------------------------------------
-
-                if abs(
-                    current_price - entry
-                ) <= 0.60:
-
-                    entry_reached = True
-
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=(
-                            "🟢 SIMULATED ENTRY\n\n"
-                            + format_trade(trade)
-                            + f"\n\nالسعر الحالي: {current_price:.2f}"
-                        ),
-                    )
-
-                    break
-
-            # -------------------------------------------------
-            # Entry not reached
-            # -------------------------------------------------
-
-            if not entry_reached:
-
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "⚪ تم إلغاء الـ setup.\n"
-                        "السعر لم يصل إلى منطقة الدخول خلال 5 دقائق.\n\n"
-                        "سيتم البحث عن فرصة جديدة."
+                await send_message(
+                    context,
+                    chat_id,
+                    (
+                        "⌛ Entry not reached "
+                        "within 5 minutes.\n\n"
+                        "Setup cancelled."
                     ),
                 )
 
                 continue
 
-            # -------------------------------------------------
-            # MONITOR TRADE
-            # -------------------------------------------------
+            # -----------------------------------------
+            # SIMULATED TRADE START
+            # -----------------------------------------
 
-            result = None
+            stats["trades"] += 1
 
-            while True:
+            await send_message(
+                context,
+                chat_id,
+                (
+                    "🟢 SIMULATED ENTRY\n\n"
+                    f"Direction: {direction}\n"
+                    f"Entry: {entry:.2f}\n"
+                    f"Current: {entry_price:.2f}\n"
+                    f"SL: {sl:.2f}\n"
+                    f"TP1: {tp1:.2f}"
+                ),
+            )
 
-                await asyncio.sleep(5)
+            # -----------------------------------------
+            # MONITOR
+            # -----------------------------------------
 
-                try:
+            result_type, exit_price = (
+                await monitor_trade(
+                    context,
+                    chat_id,
+                    trade,
+                )
+            )
 
-                    current_price = (
-                        await loop.run_in_executor(
-                            executor,
-                            get_live_gold_price,
-                        )
-                    )
+            # -----------------------------------------
+            # WIN
+            # -----------------------------------------
 
-                except asyncio.CancelledError:
-                    raise
-
-                except Exception:
-                    continue
-
-                # BUY
-                if direction == "BUY":
-
-                    if current_price <= sl:
-
-                        result = "LOSS"
-
-                        break
-
-                    if current_price >= tp1:
-
-                        result = "WIN"
-
-                        break
-
-                # SELL
-                elif direction == "SELL":
-
-                    if current_price >= sl:
-
-                        result = "LOSS"
-
-                        break
-
-                    if current_price <= tp1:
-
-                        result = "WIN"
-
-                        break
-
-            # -------------------------------------------------
-            # Result
-            # -------------------------------------------------
-
-            if result == "WIN":
+            if result_type == "WIN":
 
                 stats["wins"] += 1
 
-                # Simulated PnL using 1R = entry-to-SL distance.
-                risk = abs(
-                    entry - sl
-                )
-
-                reward = abs(
-                    tp1 - entry
-                )
-
-                pnl = reward
+                if direction == "BUY":
+                    pnl = exit_price - entry
+                else:
+                    pnl = entry - exit_price
 
                 stats["pnl"] += pnl
 
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
+                await send_message(
+                    context,
+                    chat_id,
+                    (
                         "✅ TP1 HIT\n\n"
-                        f"Direction: {direction}\n"
-                        f"Entry: {entry:.2f}\n"
-                        f"TP1: {tp1:.2f}\n\n"
-                        f"Simulated PnL: +{pnl:.2f}"
+                        f"Exit: {exit_price:.2f}\n"
+                        f"Simulated PnL: {pnl:+.2f}"
                     ),
                 )
+
+            # -----------------------------------------
+            # LOSS
+            # -----------------------------------------
 
             else:
 
                 stats["losses"] += 1
 
-                risk = abs(
-                    entry - sl
-                )
-
-                pnl = -risk
+                if direction == "BUY":
+                    pnl = exit_price - entry
+                else:
+                    pnl = entry - exit_price
 
                 stats["pnl"] += pnl
 
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=(
-                        "❌ SL HIT\n\n"
-                        f"Direction: {direction}\n"
-                        f"Entry: {entry:.2f}\n"
-                        f"SL: {sl:.2f}\n\n"
-                        f"Simulated PnL: {pnl:.2f}"
+                await send_message(
+                    context,
+                    chat_id,
+                    (
+                        "❌ STOP LOSS HIT\n\n"
+                        f"Exit: {exit_price:.2f}\n"
+                        f"Simulated PnL: {pnl:+.2f}"
                     ),
                 )
 
-            # -------------------------------------------------
-            # New analysis immediately
-            # -------------------------------------------------
+            # -----------------------------------------
+            # REANALYZE
+            # -----------------------------------------
 
-            await asyncio.sleep(2)
+            await asyncio.sleep(5)
 
-    except asyncio.CancelledError:
+        except asyncio.CancelledError:
 
-        print(
-            f"Analysis task cancelled for {chat_id}"
-        )
+            print(
+                f"Analysis loop cancelled "
+                f"for {chat_id}"
+            )
 
-        raise
+            raise
 
-    except Exception as e:
+        except Exception as e:
 
-        print(
-            f"Analysis loop crashed: {e}"
-        )
+            print(
+                "Analysis loop error:",
+                e,
+            )
 
-        try:
-
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    "⚠️ توقفت عملية التحليل بسبب خطأ.\n"
-                    "اضغط 🚀 لبدء تحليل جديد."
+            await send_message(
+                context,
+                chat_id,
+                (
+                    "⚠️ Error أثناء التحليل:\n"
+                    f"{e}"
                 ),
             )
 
-        except Exception:
-            pass
-
-    finally:
-
-        # Only remove the task if this is still
-        # the currently registered task.
-        if (
-            tasks.get(chat_id)
-            is current_task
-        ):
-            tasks.pop(
-                chat_id,
-                None,
-            )
-
-        print(
-            f"Analysis loop finished for {chat_id}"
-        )
+            # Avoid rapid error loop.
+            await asyncio.sleep(30)
 
 
 # =========================================================
-# /START
+# START
 # =========================================================
 
 async def start(
@@ -1245,10 +1138,32 @@ async def start(
     context: ContextTypes.DEFAULT_TYPE,
 ):
 
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🚀 حلل يا جيمني",
+                callback_data="start_analysis",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🛑 إيقاف",
+                callback_data="stop_analysis",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "📊 ملخص",
+                callback_data="summary",
+            )
+        ],
+    ]
+
     await update.message.reply_text(
-        "🤖 RustyGold جاهز\n\n"
-        "اختر الأمر:",
-        reply_markup=main_keyboard(),
+        "RustyGold جاهز 🟡",
+        reply_markup=InlineKeyboardMarkup(
+            keyboard
+        ),
     )
 
 
@@ -1267,15 +1182,18 @@ async def button_handler(
 
     chat_id = query.message.chat_id
 
-    # -------------------------------------------------
+    # -----------------------------------------
     # START ANALYSIS
-    # -------------------------------------------------
+    # -----------------------------------------
 
     if query.data == "start_analysis":
 
         existing = tasks.get(chat_id)
 
-        if existing and not existing.done():
+        if (
+            existing
+            and not existing.done()
+        ):
 
             await query.message.reply_text(
                 "⚠️ التحليل يعمل بالفعل."
@@ -1285,71 +1203,72 @@ async def button_handler(
 
         task = asyncio.create_task(
             analysis_loop(
-                chat_id,
                 context,
+                chat_id,
             )
         )
 
         tasks[chat_id] = task
 
         await query.message.reply_text(
-            "🚀 بدأ RustyGold التحليل المستمر."
+            "🚀 بدأت المراقبة والتحليل."
         )
 
-    # -------------------------------------------------
+    # -----------------------------------------
     # STOP
-    # -------------------------------------------------
+    # -----------------------------------------
 
-    elif query.data == "stop":
+    elif query.data == "stop_analysis":
 
         task = tasks.get(chat_id)
 
         if task and not task.done():
 
             # Cancel immediately.
-            # We intentionally do NOT await the task.
             task.cancel()
 
-            tasks.pop(
-                chat_id,
-                None,
-            )
+            # Do not await it here.
+            # This makes STOP respond immediately.
+
+            tasks.pop(chat_id, None)
 
             await query.message.reply_text(
-                "🛑 تم إيقاف المهمة فورًا."
+                "🛑 تم إيقاف التحليل."
             )
 
         else:
 
             await query.message.reply_text(
-                "ℹ️ لا توجد مهمة تحليل تعمل حاليًا."
+                "لا يوجد تحليل يعمل حالياً."
             )
 
-    # -------------------------------------------------
+    # -----------------------------------------
     # SUMMARY
-    # -------------------------------------------------
+    # -----------------------------------------
 
     elif query.data == "summary":
 
-        trades = stats["trades"]
+        total = stats["trades"]
         wins = stats["wins"]
         losses = stats["losses"]
         pnl = stats["pnl"]
 
-        if trades > 0:
+        if total > 0:
             winrate = (
-                wins / trades
+                wins / total
             ) * 100
         else:
             winrate = 0
 
         await query.message.reply_text(
-            "📊 RustyGold Summary\n\n"
-            f"Trades: {trades}\n"
-            f"Wins: {wins}\n"
-            f"Losses: {losses}\n"
-            f"Win rate: {winrate:.1f}%\n"
-            f"Simulated PnL: {pnl:.2f}"
+            (
+                "📊 RustyGold Summary\n\n"
+                f"Trades: {total}\n"
+                f"Wins: {wins}\n"
+                f"Losses: {losses}\n"
+                f"Win rate: {winrate:.1f}%\n"
+                f"Simulated PnL: {pnl:+.2f}"
+            )
         )
 
 
@@ -1357,20 +1276,27 @@ async def button_handler(
 # FLASK
 # =========================================================
 
-@app.route("/")
+flask_app = Flask(__name__)
+
+
+@flask_app.route("/")
 def home():
+
     return "RustyGold is running."
 
 
 def run_flask():
-    app.run(
+
+    port = int(
+        os.getenv(
+            "PORT",
+            "10000",
+        )
+    )
+
+    flask_app.run(
         host="0.0.0.0",
-        port=int(
-            os.getenv(
-                "PORT",
-                "10000",
-            )
-        ),
+        port=port,
     )
 
 
@@ -1380,41 +1306,12 @@ def run_flask():
 
 def main():
 
-    # Validate environment variables
-    missing = []
-
-    if not TELEGRAM_TOKEN:
-        missing.append(
-            "TELEGRAM_TOKEN"
-        )
-
-    if not TWELVEDATA_KEY:
-        missing.append(
-            "TWELVEDATA_KEY"
-        )
-
-    if not GEMINI_KEY:
-        missing.append(
-            "GEMINI_KEY"
-        )
-
-    if missing:
-
-        raise RuntimeError(
-            "Missing environment variables: "
-            + ", ".join(missing)
-        )
-
-    # Load Gemini models at startup
-    load_gemini_models()
-
-    # Flask in background
+    # Flask keeps Render service alive.
     threading.Thread(
         target=run_flask,
         daemon=True,
     ).start()
 
-    # Telegram
     application = (
         Application.builder()
         .token(TELEGRAM_TOKEN)
@@ -1430,12 +1327,12 @@ def main():
 
     application.add_handler(
         CallbackQueryHandler(
-            button_handler,
+            button_handler
         )
     )
 
     print(
-        "RustyGold Telegram bot started."
+        "RustyGold bot is starting..."
     )
 
     application.run_polling()
@@ -1443,3 +1340,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
