@@ -8,15 +8,10 @@ import requests
 import pandas as pd
 import mplfinance as mpf
 
-from PIL import Image
 from flask import Flask
+from PIL import Image
 
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Update,
-)
-
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -25,115 +20,46 @@ from telegram.ext import (
 )
 
 from google import genai
+from google.genai import types
 
 
-# =========================================================
-# ENVIRONMENT
-# =========================================================
+# ============================================================
+# ENVIRONMENT VARIABLES
+# ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TWELVEDATA_KEY = os.getenv("TWELVEDATA_KEY")
 GEMINI_KEY = os.getenv("GEMINI_KEY")
 
-SYMBOL = "XAU/USD"
+missing = []
 
-if not TELEGRAM_TOKEN or not TWELVEDATA_KEY or not GEMINI_KEY:
+if not TELEGRAM_TOKEN:
+    missing.append("TELEGRAM_TOKEN")
 
-    missing = []
+if not TWELVEDATA_KEY:
+    missing.append("TWELVEDATA_KEY")
 
-    if not TELEGRAM_TOKEN:
-        missing.append("TELEGRAM_TOKEN")
+if not GEMINI_KEY:
+    missing.append("GEMINI_KEY")
 
-    if not TWELVEDATA_KEY:
-        missing.append("TWELVEDATA_KEY")
-
-    if not GEMINI_KEY:
-        missing.append("GEMINI_KEY")
-
+if missing:
     raise RuntimeError(
-        "Missing environment variables: "
-        + ", ".join(missing)
+        "Missing environment variables: " + ", ".join(missing)
     )
 
 
-# =========================================================
-# GEMINI
-# =========================================================
+# ============================================================
+# CLIENTS
+# ============================================================
 
-gemini_client = genai.Client(
-    api_key=GEMINI_KEY
-)
+gemini_client = genai.Client(api_key=GEMINI_KEY)
 
-gemini_models = []
+app = Flask(__name__)
 
 
-def load_gemini_models():
-
-    global gemini_models
-
-    models = []
-
-    try:
-
-        available = gemini_client.models.list()
-
-        for model in available:
-
-            name = getattr(
-                model,
-                "name",
-                "",
-            )
-
-            if not name:
-                continue
-
-            actions = getattr(
-                model,
-                "supported_actions",
-                [],
-            )
-
-            if actions:
-                if "generateContent" not in actions:
-                    continue
-
-            if "gemini" not in name.lower():
-                continue
-
-            models.append(name)
-
-        # Prefer Flash models for speed.
-        models.sort(
-            key=lambda x: (
-                "flash" not in x.lower(),
-                x.lower(),
-            )
-        )
-
-        gemini_models = models
-
-        print("\nAvailable Gemini models:")
-
-        for model in gemini_models:
-            print(" -", model)
-
-    except Exception as e:
-
-        print(
-            "Failed to load Gemini models:",
-            e,
-        )
-
-        gemini_models = []
-
-
-load_gemini_models()
-
-
-# =========================================================
-# BOT STATE
-# =========================================================
+# ============================================================
+# GLOBAL STATE
+# ============================================================
 
 tasks = {}
 
@@ -145,11 +71,12 @@ stats = {
 }
 
 
-# =========================================================
-# ICT PROMPT
-# =========================================================
+# ============================================================
+# GEMINI PROMPT
+# ============================================================
 
-ICT_PROMPT = """You are an XAU/USD aggressive-balanced scalping analyst using ICT and Price Action.
+ICT_PROMPT = r"""
+You are an XAU/USD aggressive-balanced scalping analyst using ICT and Price Action.
 
 Your objective is to detect MORE legitimate short-term trading opportunities while still avoiding random or low-quality entries.
 
@@ -164,9 +91,8 @@ TIMEFRAME HIERARCHY:
 5M = MAIN STRUCTURE
 1M = ENTRY AND EXECUTION
 
-━━━━━━━━━━━━━━━━━━
+
 1H — MARKET CONTEXT
-━━━━━━━━━━━━━━━━━━
 
 Analyze:
 - Overall direction
@@ -182,9 +108,8 @@ Do NOT reject a trade simply because the 1H direction disagrees with the 5M/1M s
 
 A strong lower-timeframe reversal is allowed if there is clear evidence.
 
-━━━━━━━━━━━━━━━━━━
+
 5M — MAIN STRUCTURE
-━━━━━━━━━━━━━━━━━━
 
 Use 5M as the primary intraday structure.
 
@@ -205,9 +130,8 @@ The 5M structure should normally support the trade.
 
 However, a 5M reversal can also be traded when liquidity is swept and 1M confirms the reversal.
 
-━━━━━━━━━━━━━━━━━━
+
 1M — SCALPING ENGINE
-━━━━━━━━━━━━━━━━━━
 
 Use 1M to identify actual entry opportunities.
 
@@ -239,9 +163,8 @@ FVG + displacement + structure confirmation
 
 Order Block + CHoCH + retest
 
-━━━━━━━━━━━━━━━━━━
+
 CONTINUATION SETUPS
-━━━━━━━━━━━━━━━━━━
 
 Prefer continuation when:
 - 5M structure is clear
@@ -250,9 +173,8 @@ Prefer continuation when:
 
 A continuation trade does NOT require a perfect 1H alignment.
 
-━━━━━━━━━━━━━━━━━━
+
 REVERSAL SETUPS
-━━━━━━━━━━━━━━━━━━
 
 Reversals are allowed.
 
@@ -265,9 +187,8 @@ A reversal becomes interesting when:
 
 A strong 1M reversal after a meaningful liquidity sweep can be traded even when 1H is still pointing in the opposite direction.
 
-━━━━━━━━━━━━━━━━━━
+
 AGGRESSIVE OPPORTUNITY RULE
-━━━━━━━━━━━━━━━━━━
 
 Do not wait for every ICT confirmation.
 
@@ -283,9 +204,8 @@ Examples:
 
 The absence of one element such as FVG or Order Block does NOT invalidate the setup.
 
-━━━━━━━━━━━━━━━━━━
+
 WHEN TO SAY NO TRADE
-━━━━━━━━━━━━━━━━━━
 
 Return NO TRADE when:
 - Market structure is genuinely unclear
@@ -302,9 +222,8 @@ Do NOT say NO TRADE merely because:
 - Order Block is absent
 - the setup is not textbook-perfect
 
-━━━━━━━━━━━━━━━━━━
+
 ENTRY
-━━━━━━━━━━━━━━━━━━
 
 ENTRY must be based on an actual price level visible in the supplied data.
 
@@ -320,9 +239,8 @@ Do not invent arbitrary prices.
 
 If the setup is already confirmed, an entry near the current market price is acceptable when justified.
 
-━━━━━━━━━━━━━━━━━━
+
 STOP LOSS
-━━━━━━━━━━━━━━━━━━
 
 Place SL beyond the structural invalidation point.
 
@@ -336,9 +254,8 @@ Do not place SL randomly.
 
 Prefer the nearest logical invalidation point that gives the setup enough room to breathe.
 
-━━━━━━━━━━━━━━━━━━
+
 TAKE PROFIT
-━━━━━━━━━━━━━━━━━━
 
 TP1 should target the nearest meaningful liquidity or logical price objective.
 
@@ -354,9 +271,8 @@ Do not demand a very large move when the nearest liquidity target is closer.
 
 Do not choose a TP simply to make the reward/risk ratio look good.
 
-━━━━━━━━━━━━━━━━━━
+
 TRADE MANAGEMENT LOGIC
-━━━━━━━━━━━━━━━━━━
 
 Favor setups where:
 - Entry is close to the invalidation level
@@ -368,9 +284,8 @@ Avoid chasing after a large impulsive candle.
 
 If price has already made most of the expected move, prefer NO TRADE.
 
-━━━━━━━━━━━━━━━━━━
+
 MARKET CONDITIONS
-━━━━━━━━━━━━━━━━━━
 
 TRENDING MARKET:
 Look for continuation and pullback entries.
@@ -385,11 +300,10 @@ HIGH MOMENTUM:
 Do not blindly chase.
 Wait for a pullback, retest, rejection, or structure confirmation when possible.
 
-━━━━━━━━━━━━━━━━━━
-DECISION
-━━━━━━━━━━━━━━━━━━
 
-Return exactly:
+DECISION
+
+Return exactly one of:
 
 TRADE
 
@@ -397,7 +311,7 @@ or
 
 NO TRADE
 
-If TRADE:
+If TRADE, the first four lines MUST be exactly:
 
 DIRECTION: BUY or SELL
 ENTRY: <price>
@@ -414,15 +328,14 @@ Then briefly explain:
 6. SL reason
 7. TP1 reason
 
-If NO TRADE:
+If NO TRADE, return:
 
 NO TRADE
 
 Reason: <brief explanation>
 
-━━━━━━━━━━━━━━━━━━
+
 FINAL OBJECTIVE
-━━━━━━━━━━━━━━━━━━
 
 You are an AGGRESSIVE-BALANCED scalping analyst.
 
@@ -435,6 +348,7 @@ Do not require perfect ICT setups.
 Allow both continuation and reversal trades.
 
 Give priority to:
+
 LIQUIDITY → STRUCTURE → CONFIRMATION → ENTRY
 
 But never manufacture a trade when the evidence is unclear.
@@ -443,22 +357,68 @@ The goal is to capture legitimate XAU/USD intraday moves, not to maximize the nu
 """
 
 
-# =========================================================
-# TWELVEDATA
-# =========================================================
+# ============================================================
+# GEMINI MODELS
+# ============================================================
 
-def fetch_candles(
-    interval,
-    outputsize,
-):
+def load_gemini_models():
+    models = []
 
-    url = (
-        "https://api.twelvedata.com/"
-        "time_series"
+    try:
+        for model in gemini_client.models.list():
+            name = getattr(model, "name", None)
+
+            if not name:
+                continue
+
+            name_lower = name.lower()
+
+            if "gemini" not in name_lower:
+                continue
+
+            supported = getattr(
+                model,
+                "supported_actions",
+                None
+            )
+
+            if supported:
+                supported_text = str(supported).lower()
+
+                if (
+                    "generatecontent" not in supported_text
+                    and "generate_content" not in supported_text
+                ):
+                    continue
+
+            models.append(name)
+
+    except Exception as e:
+        print("Gemini model list error:", e)
+
+    # Remove duplicates
+    models = list(dict.fromkeys(models))
+
+    # Prefer Flash models
+    models.sort(
+        key=lambda x: (
+            0 if "flash" in x.lower() else 1,
+            x
+        )
     )
 
+    return models
+
+
+# ============================================================
+# TWELVEDATA
+# ============================================================
+
+def fetch_candles(interval, outputsize):
+    url = "https://api.twelvedata.com/time_series"
+
     params = {
-        "symbol": SYMBOL,
+        "symbol": "XAU/USD",
         "interval": interval,
         "outputsize": outputsize,
         "apikey": TWELVEDATA_KEY,
@@ -468,29 +428,30 @@ def fetch_candles(
     response = requests.get(
         url,
         params=params,
-        timeout=20,
+        timeout=30
     )
 
     response.raise_for_status()
 
     data = response.json()
 
-    if "values" not in data:
-
+    if "status" in data and data["status"] == "error":
         raise RuntimeError(
-            f"TwelveData error: {data}"
+            "TwelveData error: "
+            + str(data.get("message", data))
         )
 
-    df = pd.DataFrame(
-        data["values"]
-    )
+    values = data.get("values")
+
+    if not values:
+        raise RuntimeError(
+            f"No candle data returned for {interval}"
+        )
+
+    df = pd.DataFrame(values)
 
     df["datetime"] = pd.to_datetime(
         df["datetime"]
-    )
-
-    df = df.set_index(
-        "datetime"
     )
 
     for column in [
@@ -499,10 +460,9 @@ def fetch_candles(
         "low",
         "close",
     ]:
-
         df[column] = pd.to_numeric(
             df[column],
-            errors="coerce",
+            errors="coerce"
         )
 
     df = df.dropna(
@@ -514,25 +474,23 @@ def fetch_candles(
         ]
     )
 
-    df = df.sort_index()
+    df = df.sort_values("datetime")
+
+    df = df.set_index("datetime")
 
     return df
 
 
-# =========================================================
-# GOLD PRICE
-# =========================================================
+# ============================================================
+# LIVE GOLD PRICE
+# ============================================================
 
 def fetch_gold_price():
-
-    url = (
-        "https://api.gold-api.com/"
-        "price/XAU"
-    )
+    url = "https://api.gold-api.com/price/XAU"
 
     response = requests.get(
         url,
-        timeout=15,
+        timeout=15
     )
 
     response.raise_for_status()
@@ -542,37 +500,28 @@ def fetch_gold_price():
     price = data.get("price")
 
     if price is None:
-
         raise RuntimeError(
-            f"Gold API error: {data}"
+            "Gold API did not return a price."
         )
 
     return float(price)
 
 
-# =========================================================
-# OHLC TEXT
-# =========================================================
+# ============================================================
+# DATA -> TEXT
+# ============================================================
 
-def dataframe_to_ohlc_text(
-    df,
-    max_rows=None,
-):
+def dataframe_to_ohlc_text(df, max_rows=None):
+    temp = df.copy()
 
-    if max_rows is not None:
-        data = df.tail(max_rows)
-    else:
-        data = df
+    if max_rows:
+        temp = temp.tail(max_rows)
 
     lines = [
         "datetime,open,high,low,close"
     ]
 
-    for idx, row in data.iterrows():
-
-        timestamp = idx.strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+    for timestamp, row in temp.iterrows():
 
         lines.append(
             f"{timestamp},"
@@ -585,223 +534,203 @@ def dataframe_to_ohlc_text(
     return "\n".join(lines)
 
 
-# =========================================================
-# CHART CREATION
-# =========================================================
+# ============================================================
+# CHART
+# ============================================================
 
 def create_chart(
     df,
     title,
-    max_rows=None,
+    max_rows=None
 ):
+    temp = df.copy()
 
-    if max_rows is not None:
-        chart_df = df.tail(max_rows).copy()
-    else:
-        chart_df = df.copy()
+    if max_rows:
+        temp = temp.tail(max_rows)
 
-    chart_df.index.name = "Date"
+    if len(temp) < 5:
+        raise RuntimeError(
+            f"Not enough candles for chart: {title}"
+        )
 
-    buf = io.BytesIO()
+    buffer = io.BytesIO()
 
     mpf.plot(
-        chart_df,
+        temp,
         type="candle",
         style="charles",
         title=title,
-        ylabel="XAU/USD",
-        volume=False,
         figsize=(14, 7),
-        tight_layout=True,
-        savefig={
-            "fname": buf,
-            "dpi": 130,
-            "bbox_inches": "tight",
-        },
+        volume=False,
+        savefig=dict(
+            fname=buffer,
+            dpi=130,
+            bbox_inches="tight"
+        )
     )
 
-    buf.seek(0)
+    buffer.seek(0)
 
-    return buf.getvalue()
-
-
-# =========================================================
-# IMAGE CONVERSION
-# =========================================================
-
-def bytes_to_image(
-    image_bytes,
-):
-
-    image = Image.open(
-        io.BytesIO(image_bytes)
-    )
-
-    # Make sure the image is RGB.
-    if image.mode != "RGB":
-        image = image.convert("RGB")
+    image = Image.open(buffer).convert("RGB")
 
     return image
 
 
-# =========================================================
-# GEMINI REQUEST
-# =========================================================
+# ============================================================
+# GEMINI CALL
+# ============================================================
 
 def call_gemini(
     model_name,
     prompt,
     image_1h,
     image_5m,
-    image_1m,
+    image_1m
 ):
 
-    img_1h = bytes_to_image(
-        image_1h
-    )
+    def image_part(image):
+        buffer = io.BytesIO()
 
-    img_5m = bytes_to_image(
-        image_5m
-    )
-
-    img_1m = bytes_to_image(
-        image_1m
-    )
-
-    response = (
-        gemini_client
-        .models
-        .generate_content(
-            model=model_name,
-            contents=[
-                prompt,
-                "IMAGE 1 — 1H WEEK",
-                img_1h,
-                "IMAGE 2 — 5M LAST 24 HOURS",
-                img_5m,
-                "IMAGE 3 — 1M LAST 4 HOURS",
-                img_1m,
-            ],
+        image.save(
+            buffer,
+            format="PNG"
         )
+
+        return types.Part.from_bytes(
+            data=buffer.getvalue(),
+            mime_type="image/png"
+        )
+
+    contents = [
+        prompt,
+
+        "\nIMAGE 1 — 1H WEEK\n",
+        image_part(image_1h),
+
+        "\nIMAGE 2 — 5M LAST 24 HOURS\n",
+        image_part(image_5m),
+
+        "\nIMAGE 3 — 1M LAST 4 HOURS\n",
+        image_part(image_1m),
+    ]
+
+    response = gemini_client.models.generate_content(
+        model=model_name,
+        contents=contents
     )
 
-    return response
+    text = getattr(
+        response,
+        "text",
+        None
+    )
+
+    if not text:
+        raise RuntimeError(
+            "Gemini returned an empty response."
+        )
+
+    return text
 
 
-# =========================================================
-# GEMINI ANALYSIS
-# =========================================================
+# ============================================================
+# ANALYZE WITH GEMINI
+# ============================================================
 
 def analyze_with_gemini(
-    price,
-    image_1h,
-    image_5m,
-    image_1m,
     ohlc_1h,
     ohlc_5m,
     ohlc_1m,
+    image_1h,
+    image_5m,
+    image_1m,
+    current_price
 ):
 
-    if not gemini_models:
+    prompt = f"""
+{ICT_PROMPT}
 
-        load_gemini_models()
+CURRENT XAU/USD PRICE:
+{current_price:.2f}
 
-    if not gemini_models:
+==================================================
+1H OHLC — APPROXIMATELY ONE WEEK
+==================================================
 
-        return (
-            "NO TRADE\n"
-            "REASON: No available Gemini model."
+{ohlc_1h}
+
+==================================================
+5M OHLC — APPROXIMATELY 24 HOURS
+==================================================
+
+{ohlc_5m}
+
+==================================================
+1M OHLC — LATEST DATA
+==================================================
+
+{ohlc_1m}
+
+==================================================
+
+Analyze the charts and OHLC data together.
+
+Remember:
+
+1H = context
+5M = main structure
+1M = entry confirmation
+
+Return a trade only when the setup is actually coherent.
+"""
+
+    models = load_gemini_models()
+
+    if not models:
+        raise RuntimeError(
+            "No usable Gemini models were found."
         )
 
-    prompt = ICT_PROMPT.format(
-        price=f"{price:.2f}",
-        ohlc_1h=ohlc_1h,
-        ohlc_5m=ohlc_5m,
-        ohlc_1m=ohlc_1m,
-    )
+    last_error = None
 
-    for model_name in gemini_models:
+    for model_name in models:
 
         try:
-
             print(
-                f"Trying Gemini model: "
-                f"{model_name}"
+                f"Trying Gemini model: {model_name}"
             )
 
-            response = call_gemini(
+            result = call_gemini(
                 model_name,
                 prompt,
                 image_1h,
                 image_5m,
-                image_1m,
+                image_1m
             )
 
-            text = getattr(
-                response,
-                "text",
-                None,
+            print(
+                f"Gemini success: {model_name}"
             )
 
-            if text:
-
-                print(
-                    f"Gemini success: "
-                    f"{model_name}"
-                )
-
-                print(text)
-
-                return text
+            return result
 
         except Exception as e:
 
+            last_error = e
+
             print(
-                f"Gemini model failed "
-                f"{model_name}: {e}"
+                f"Gemini failed on {model_name}: {e}"
             )
 
-    return (
-        "NO TRADE\n"
-        "REASON: All Gemini models failed."
+    raise RuntimeError(
+        "All Gemini models failed. "
+        f"Last error: {last_error}"
     )
 
 
-# =========================================================
-# NUMBER EXTRACTION
-# =========================================================
-
-def extract_number(
-    text,
-    labels,
-):
-
-    for label in labels:
-
-        pattern = (
-            rf"{label}"
-            rf"\s*[:=]\s*"
-            rf"(\d+(?:\.\d+)?)"
-        )
-
-        match = re.search(
-            pattern,
-            text,
-            re.IGNORECASE,
-        )
-
-        if match:
-
-            return float(
-                match.group(1)
-            )
-
-    return None
-
-
-# =========================================================
-# TRADE PARSER
-# =========================================================
+# ============================================================
+# PARSE TRADE
+# ============================================================
 
 def parse_trade(text):
 
@@ -813,110 +742,65 @@ def parse_trade(text):
     if "NO TRADE" in upper:
         return None
 
-    direction = None
-
-    buy_match = re.search(
-        r"DIRECTION\s*[:=]\s*BUY",
-        upper,
+    direction_match = re.search(
+        r"DIRECTION\s*:\s*(BUY|SELL)",
+        upper
     )
 
-    sell_match = re.search(
-        r"DIRECTION\s*[:=]\s*SELL",
-        upper,
+    entry_match = re.search(
+        r"ENTRY\s*:\s*([0-9]+(?:\.[0-9]+)?)",
+        upper
     )
 
-    if buy_match:
+    sl_match = re.search(
+        r"SL\s*:\s*([0-9]+(?:\.[0-9]+)?)",
+        upper
+    )
 
-        direction = "BUY"
+    tp_match = re.search(
+        r"TP1\s*:\s*([0-9]+(?:\.[0-9]+)?)",
+        upper
+    )
 
-    elif sell_match:
-
-        direction = "SELL"
-
-    else:
-
-        if re.search(
-            r"\bBUY\b",
-            upper,
-        ):
-
-            direction = "BUY"
-
-        elif re.search(
-            r"\bSELL\b",
-            upper,
-        ):
-
-            direction = "SELL"
-
-    if direction is None:
+    if not all([
+        direction_match,
+        entry_match,
+        sl_match,
+        tp_match,
+    ]):
         return None
 
-    entry = extract_number(
-        upper,
-        [
-            "ENTRY",
-            "ENTRY PRICE",
-        ],
-    )
+    direction = direction_match.group(1)
 
-    sl = extract_number(
-        upper,
-        [
-            "SL",
-            "STOP LOSS",
-            "STOPLOSS",
-        ],
-    )
+    entry = float(entry_match.group(1))
+    sl = float(sl_match.group(1))
+    tp1 = float(tp_match.group(1))
 
-    tp1 = extract_number(
-        upper,
-        [
-            "TP1",
-            "TAKE PROFIT 1",
-            "TAKE PROFIT",
-            "TP",
-        ],
-    )
-
-    if (
-        entry is None
-        or sl is None
-        or tp1 is None
-    ):
-
-        return None
-
-    # Validate BUY ordering.
+    # Validate structure
     if direction == "BUY":
 
         if not (
             sl < entry < tp1
         ):
-
             print(
-                "Invalid BUY ordering:",
+                "Invalid BUY setup:",
                 entry,
                 sl,
-                tp1,
+                tp1
             )
-
             return None
 
-    # Validate SELL ordering.
-    if direction == "SELL":
+    elif direction == "SELL":
 
         if not (
             tp1 < entry < sl
         ):
-
             print(
-                "Invalid SELL ordering:",
+                "Invalid SELL setup:",
                 entry,
                 sl,
-                tp1,
+                tp1
             )
-
             return None
 
     return {
@@ -927,73 +811,34 @@ def parse_trade(text):
     }
 
 
-# =========================================================
-# TELEGRAM SEND
-# =========================================================
-
-async def send_message(
-    context,
-    chat_id,
-    text,
-):
-
-    try:
-
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-        )
-
-    except Exception as e:
-
-        print(
-            "Telegram send error:",
-            e,
-        )
-
-
-# =========================================================
+# ============================================================
 # WAIT FOR ENTRY
-# =========================================================
+# ============================================================
 
 async def wait_for_entry(
-    trade,
+    direction,
+    entry,
+    tolerance=0.60,
+    max_seconds=300
 ):
 
-    entry = trade["entry"]
+    checks = int(max_seconds / 5)
 
-    # Simulation entry tolerance.
-    tolerance = 0.60
-
-    # Wait for maximum 5 minutes.
-    end_time = (
-        asyncio.get_running_loop().time()
-        + 300
-    )
-
-    while (
-        asyncio.get_running_loop().time()
-        < end_time
-    ):
+    for _ in range(checks):
 
         try:
-
             price = await asyncio.to_thread(
                 fetch_gold_price
             )
 
-            distance = abs(
-                price - entry
-            )
-
             print(
-                "Waiting entry | "
-                f"Price={price:.2f} | "
-                f"Entry={entry:.2f} | "
-                f"Distance={distance:.2f}"
+                f"Waiting entry | "
+                f"Direction={direction} "
+                f"Entry={entry:.2f} "
+                f"Price={price:.2f}"
             )
 
-            if distance <= tolerance:
+            if abs(price - entry) <= tolerance:
 
                 return price
 
@@ -1001,7 +846,7 @@ async def wait_for_entry(
 
             print(
                 "Entry price error:",
-                e,
+                e
             )
 
         await asyncio.sleep(5)
@@ -1009,405 +854,431 @@ async def wait_for_entry(
     return None
 
 
-# =========================================================
-# MONITOR TRADE
-# =========================================================
+# ============================================================
+# MONITOR SIMULATED TRADE
+# ============================================================
 
 async def monitor_trade(
-    trade,
+    direction,
+    entry,
+    sl,
+    tp1,
+    max_seconds=3600
 ):
 
-    direction = trade["direction"]
+    checks = int(max_seconds / 5)
 
-    entry = trade["entry"]
-    sl = trade["sl"]
-    tp1 = trade["tp1"]
-
-    while True:
+    for _ in range(checks):
 
         try:
-
             price = await asyncio.to_thread(
                 fetch_gold_price
             )
 
             print(
-                "Trade monitor | "
+                f"Trade monitor | "
                 f"{direction} | "
-                f"Price={price:.2f} | "
+                f"Entry={entry:.2f} | "
                 f"SL={sl:.2f} | "
-                f"TP={tp1:.2f}"
+                f"TP={tp1:.2f} | "
+                f"Price={price:.2f}"
             )
 
             if direction == "BUY":
 
                 if price <= sl:
+                    pnl = sl - entry
 
-                    return (
-                        "LOSS",
-                        price,
-                    )
+                    return {
+                        "result": "LOSS",
+                        "exit": sl,
+                        "pnl": pnl,
+                    }
 
                 if price >= tp1:
+                    pnl = tp1 - entry
 
-                    return (
-                        "WIN",
-                        price,
-                    )
+                    return {
+                        "result": "WIN",
+                        "exit": tp1,
+                        "pnl": pnl,
+                    }
 
-            elif direction == "SELL":
+            else:
 
                 if price >= sl:
+                    pnl = entry - sl
 
-                    return (
-                        "LOSS",
-                        price,
-                    )
+                    return {
+                        "result": "LOSS",
+                        "exit": sl,
+                        "pnl": pnl,
+                    }
 
                 if price <= tp1:
+                    pnl = entry - tp1
 
-                    return (
-                        "WIN",
-                        price,
-                    )
+                    return {
+                        "result": "WIN",
+                        "exit": tp1,
+                        "pnl": pnl,
+                    }
 
         except Exception as e:
 
             print(
-                "Trade monitor error:",
-                e,
+                "Trade monitoring error:",
+                e
             )
 
         await asyncio.sleep(5)
 
+    return {
+        "result": "TIMEOUT",
+        "exit": None,
+        "pnl": 0.0,
+    }
 
-# =========================================================
-# ANALYSIS LOOP
-# =========================================================
 
-async def analysis_loop(
-    context,
+# ============================================================
+# SEND LONG TEXT SAFELY
+# ============================================================
+
+async def send_long_message(
+    bot,
     chat_id,
+    text
 ):
 
-    print(
-        f"Started RustyGold "
-        f"for chat {chat_id}"
+    max_length = 4000
+
+    if len(text) <= max_length:
+
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text
+        )
+
+        return
+
+    for i in range(
+        0,
+        len(text),
+        max_length
+    ):
+
+        chunk = text[
+            i:i + max_length
+        ]
+
+        await bot.send_message(
+            chat_id=chat_id,
+            text=chunk
+        )
+
+
+# ============================================================
+# ANALYSIS LOOP
+# ============================================================
+
+async def analysis_loop(
+    chat_id,
+    bot
+):
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            "🚀 RustyGold بدأ التحليل.\n\n"
+            "1H = سياق\n"
+            "5M = الهيكل الرئيسي\n"
+            "1M = تأكيد الدخول\n\n"
+            "التداول محاكاة فقط."
+        )
     )
 
     while True:
 
         try:
 
-            # =================================================
-            # FETCH MARKET DATA
-            # =================================================
+            # --------------------------------------------
+            # FETCH DATA
+            # --------------------------------------------
 
-            # 1H:
-            # 168 candles ≈ 7 days.
+            print("Fetching market data...")
+
             df_1h = await asyncio.to_thread(
                 fetch_candles,
                 "1h",
-                168,
+                168
             )
 
-            # 5M:
-            # 288 candles ≈ 24 hours.
             df_5m = await asyncio.to_thread(
                 fetch_candles,
                 "5min",
-                288,
+                288
             )
 
-            # 1M:
-            # 720 candles ≈ 12 hours.
             df_1m = await asyncio.to_thread(
                 fetch_candles,
                 "1min",
-                720,
+                720
             )
 
-            # Current live gold price.
-            price = await asyncio.to_thread(
+            current_price = await asyncio.to_thread(
                 fetch_gold_price
             )
 
-            # =================================================
-            # CREATE CHARTS
-            # =================================================
+            print(
+                f"Current XAU/USD: "
+                f"{current_price:.2f}"
+            )
 
-            # 1H:
-            # Full week.
+            # --------------------------------------------
+            # CREATE CHARTS
+            # --------------------------------------------
+
             image_1h = await asyncio.to_thread(
                 create_chart,
                 df_1h,
-                "XAU/USD - 1H - 1 Week",
-                168,
+                "XAU/USD — 1H — 1 Week",
+                168
             )
 
-            # 5M:
-            # Full 24 hours.
             image_5m = await asyncio.to_thread(
                 create_chart,
                 df_5m,
-                "XAU/USD - 5M - 24 Hours",
-                288,
+                "XAU/USD — 5M — 24 Hours",
+                288
             )
 
-            # 1M:
-            # Only latest 4 hours for visual clarity.
             image_1m = await asyncio.to_thread(
                 create_chart,
                 df_1m,
-                "XAU/USD - 1M - Last 4 Hours",
-                240,
+                "XAU/USD — 1M — Last 4 Hours",
+                240
             )
 
-            # =================================================
-            # PREPARE OHLC DATA
-            # =================================================
+            # --------------------------------------------
+            # PREPARE OHLC
+            # --------------------------------------------
 
-            # 1H:
-            # Full week.
-            ohlc_1h = (
-                dataframe_to_ohlc_text(
-                    df_1h,
-                    168,
+            ohlc_1h = dataframe_to_ohlc_text(
+                df_1h,
+                168
+            )
+
+            ohlc_5m = dataframe_to_ohlc_text(
+                df_5m,
+                288
+            )
+
+            # Only latest 180 candles are sent as raw 1M text.
+            # The chart still shows the latest 4 hours.
+            ohlc_1m = dataframe_to_ohlc_text(
+                df_1m,
+                180
+            )
+
+            # --------------------------------------------
+            # SEND MARKET SNAPSHOT
+            # --------------------------------------------
+
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "🔎 تحليل XAU/USD...\n\n"
+                    f"السعر الحالي: {current_price:.2f}\n\n"
+                    "📊 1H: أسبوع\n"
+                    "📊 5M: آخر 24 ساعة\n"
+                    "📊 1M: تأكيد السكالب"
                 )
             )
 
-            # 5M:
-            # Full 24 hours.
-            ohlc_5m = (
-                dataframe_to_ohlc_text(
-                    df_5m,
-                    288,
-                )
-            )
-
-            # 1M:
-            # We collected 12 hours,
-            # but send only the latest 180 candles
-            # to keep the prompt focused.
-            ohlc_1m = (
-                dataframe_to_ohlc_text(
-                    df_1m,
-                    180,
-                )
-            )
-
-            # =================================================
+            # --------------------------------------------
             # GEMINI
-            # =================================================
+            # --------------------------------------------
 
-            result = await asyncio.to_thread(
+            gemini_result = await asyncio.to_thread(
                 analyze_with_gemini,
-                price,
-                image_1h,
-                image_5m,
-                image_1m,
                 ohlc_1h,
                 ohlc_5m,
                 ohlc_1m,
+                image_1h,
+                image_5m,
+                image_1m,
+                current_price
             )
 
-            # =================================================
+            print(
+                "Gemini result:\n",
+                gemini_result
+            )
+
+            # --------------------------------------------
             # PARSE
-            # =================================================
+            # --------------------------------------------
 
             trade = parse_trade(
-                result
+                gemini_result
             )
 
-            # =================================================
+            # --------------------------------------------
             # NO TRADE
-            # =================================================
+            # --------------------------------------------
 
             if trade is None:
 
-                await send_message(
-                    context,
+                await send_long_message(
+                    bot,
                     chat_id,
                     (
-                        "🔎 RustyGold\n\n"
-                        f"Current price: "
-                        f"{price:.2f}\n\n"
-                        f"{result}"
-                    ),
+                        "⚪ NO TRADE\n\n"
+                        + gemini_result
+                        + "\n\n"
+                        "⏳ سأعيد التحليل بعد 5 دقائق."
+                    )
                 )
 
-                # Recheck after 5 minutes.
                 await asyncio.sleep(300)
 
                 continue
 
-            # =================================================
+            # --------------------------------------------
             # TRADE FOUND
-            # =================================================
+            # --------------------------------------------
 
-            direction = trade[
-                "direction"
-            ]
+            direction = trade["direction"]
+            entry = trade["entry"]
+            sl = trade["sl"]
+            tp1 = trade["tp1"]
 
-            entry = trade[
-                "entry"
-            ]
-
-            sl = trade[
-                "sl"
-            ]
-
-            tp1 = trade[
-                "tp1"
-            ]
-
-            await send_message(
-                context,
-                chat_id,
-                (
-                    "🚨 TRADE SETUP\n\n"
-                    f"Direction: {direction}\n"
-                    f"Entry: {entry:.2f}\n"
-                    f"SL: {sl:.2f}\n"
-                    f"TP1: {tp1:.2f}\n\n"
-                    f"{result}"
-                ),
+            setup_message = (
+                "🎯 TRADE SETUP — SIMULATION\n\n"
+                f"📌 Direction: {direction}\n"
+                f"🎯 Entry: {entry:.2f}\n"
+                f"🛑 SL: {sl:.2f}\n"
+                f"💰 TP1: {tp1:.2f}\n\n"
+                "⏳ أنتظر وصول السعر لمنطقة الدخول...\n"
+                "⚠️ محاكاة فقط — لا يوجد أمر حقيقي."
             )
 
-            # =================================================
+            await bot.send_message(
+                chat_id=chat_id,
+                text=setup_message
+            )
+
+            # --------------------------------------------
             # WAIT FOR ENTRY
-            # =================================================
+            # --------------------------------------------
 
-            entry_price = (
-                await wait_for_entry(
-                    trade
-                )
+            entry_price = await wait_for_entry(
+                direction,
+                entry,
+                tolerance=0.60,
+                max_seconds=300
             )
+
+            # --------------------------------------------
+            # ENTRY NOT REACHED
+            # --------------------------------------------
 
             if entry_price is None:
 
-                await send_message(
-                    context,
-                    chat_id,
-                    (
-                        "⌛ Entry was not reached "
-                        "within 5 minutes.\n\n"
-                        "Setup cancelled."
-                    ),
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "⌛ لم يصل السعر إلى منطقة الدخول "
+                        "خلال 5 دقائق.\n\n"
+                        "❌ تم إلغاء الصفقة المحاكاة.\n"
+                        "🔄 سأعيد التحليل."
+                    )
                 )
 
                 continue
 
-            # =================================================
+            # --------------------------------------------
             # SIMULATED ENTRY
-            # =================================================
+            # --------------------------------------------
 
             stats["trades"] += 1
 
-            await send_message(
-                context,
-                chat_id,
-                (
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
                     "🟢 SIMULATED ENTRY\n\n"
                     f"Direction: {direction}\n"
-                    f"Entry: {entry:.2f}\n"
-                    f"Current: "
-                    f"{entry_price:.2f}\n"
+                    f"Entry: {entry_price:.2f}\n"
                     f"SL: {sl:.2f}\n"
-                    f"TP1: {tp1:.2f}"
-                ),
-            )
-
-            # =================================================
-            # MONITOR
-            # =================================================
-
-            result_type, exit_price = (
-                await monitor_trade(
-                    trade
+                    f"TP1: {tp1:.2f}\n\n"
+                    "📡 بدأت مراقبة الصفقة."
                 )
             )
 
-            # =================================================
-            # WIN
-            # =================================================
+            # --------------------------------------------
+            # MONITOR
+            # --------------------------------------------
+
+            result = await monitor_trade(
+                direction,
+                entry_price,
+                sl,
+                tp1
+            )
+
+            result_type = result["result"]
+            pnl = result["pnl"]
+            exit_price = result["exit"]
+
+            # --------------------------------------------
+            # UPDATE STATS
+            # --------------------------------------------
+
+            stats["pnl"] += pnl
 
             if result_type == "WIN":
 
                 stats["wins"] += 1
 
-                if direction == "BUY":
-
-                    pnl = (
-                        exit_price
-                        - entry
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "✅ SIMULATED WIN\n\n"
+                        f"Exit: {exit_price:.2f}\n"
+                        f"Simulated PnL: {pnl:+.2f}\n\n"
+                        "🔄 إعادة التحليل..."
                     )
-
-                else:
-
-                    pnl = (
-                        entry
-                        - exit_price
-                    )
-
-                stats["pnl"] += pnl
-
-                await send_message(
-                    context,
-                    chat_id,
-                    (
-                        "✅ TP1 HIT\n\n"
-                        f"Exit: "
-                        f"{exit_price:.2f}\n"
-                        f"Simulated PnL: "
-                        f"{pnl:+.2f}"
-                    ),
                 )
 
-            # =================================================
-            # LOSS
-            # =================================================
-
-            else:
+            elif result_type == "LOSS":
 
                 stats["losses"] += 1
 
-                if direction == "BUY":
-
-                    pnl = (
-                        exit_price
-                        - entry
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "❌ SIMULATED LOSS\n\n"
+                        f"Exit: {exit_price:.2f}\n"
+                        f"Simulated PnL: {pnl:+.2f}\n\n"
+                        "🔄 إعادة التحليل..."
                     )
-
-                else:
-
-                    pnl = (
-                        entry
-                        - exit_price
-                    )
-
-                stats["pnl"] += pnl
-
-                await send_message(
-                    context,
-                    chat_id,
-                    (
-                        "❌ STOP LOSS HIT\n\n"
-                        f"Exit: "
-                        f"{exit_price:.2f}\n"
-                        f"Simulated PnL: "
-                        f"{pnl:+.2f}"
-                    ),
                 )
 
-            # Small delay before next analysis.
-            await asyncio.sleep(5)
+            else:
+
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "⌛ انتهت مدة مراقبة الصفقة.\n\n"
+                        "لم يتم احتسابها Win/Loss.\n"
+                        "🔄 إعادة التحليل..."
+                    )
+                )
 
         except asyncio.CancelledError:
 
             print(
-                f"RustyGold task "
-                f"cancelled: {chat_id}"
+                f"Analysis task cancelled: {chat_id}"
             )
 
             raise
@@ -1415,68 +1286,78 @@ async def analysis_loop(
         except Exception as e:
 
             print(
-                "Analysis loop error:",
-                e,
+                "ANALYSIS LOOP ERROR:",
+                repr(e)
             )
 
-            await send_message(
-                context,
-                chat_id,
-                (
-                    "⚠️ Error أثناء التحليل:\n"
-                    f"{e}"
-                ),
-            )
+            try:
 
-            # Prevent rapid repeated errors.
-            await asyncio.sleep(30)
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "⚠️ حدث خطأ أثناء التحليل:\n\n"
+                        f"{str(e)[:1500]}\n\n"
+                        "⏳ سأحاول مرة أخرى بعد دقيقة."
+                    )
+                )
+
+            except Exception as send_error:
+
+                print(
+                    "Telegram error:",
+                    send_error
+                )
+
+            await asyncio.sleep(60)
 
 
-# =========================================================
-# START COMMAND
-# =========================================================
+# ============================================================
+# TELEGRAM START
+# ============================================================
 
-async def start(
+async def start_command(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     keyboard = [
         [
             InlineKeyboardButton(
                 "🚀 حلل يا جيمني",
-                callback_data="start_analysis",
+                callback_data="start_analysis"
             )
         ],
         [
             InlineKeyboardButton(
                 "🛑 إيقاف",
-                callback_data="stop_analysis",
-            )
-        ],
-        [
+                callback_data="stop_analysis"
+            ),
             InlineKeyboardButton(
                 "📊 ملخص",
-                callback_data="summary",
+                callback_data="summary"
             )
         ],
     ]
 
+    reply_markup = InlineKeyboardMarkup(
+        keyboard
+    )
+
     await update.message.reply_text(
-        "RustyGold جاهز 🟡",
-        reply_markup=InlineKeyboardMarkup(
-            keyboard
-        ),
+        "🤖 RustyGold جاهز.\n\n"
+        "XAU/USD — ICT / Price Action\n"
+        "التداول محاكاة فقط.",
+        reply_markup=reply_markup
     )
 
 
-# =========================================================
+# ============================================================
 # BUTTON HANDLER
-# =========================================================
+# ============================================================
 
 async def button_handler(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     query = update.callback_query
@@ -1485,19 +1366,17 @@ async def button_handler(
 
     chat_id = query.message.chat_id
 
-    # =====================================================
+    # --------------------------------------------
     # START
-    # =====================================================
+    # --------------------------------------------
 
     if query.data == "start_analysis":
 
-        existing = tasks.get(
-            chat_id
-        )
+        existing_task = tasks.get(chat_id)
 
         if (
-            existing
-            and not existing.done()
+            existing_task
+            and not existing_task.done()
         ):
 
             await query.message.reply_text(
@@ -1508,36 +1387,32 @@ async def button_handler(
 
         task = asyncio.create_task(
             analysis_loop(
-                context,
                 chat_id,
+                context.bot
             )
         )
 
         tasks[chat_id] = task
 
         await query.message.reply_text(
-            "🚀 بدأت المراقبة والتحليل."
+            "🚀 تم تشغيل RustyGold."
         )
 
-    # =====================================================
+    # --------------------------------------------
     # STOP
-    # =====================================================
+    # --------------------------------------------
 
     elif query.data == "stop_analysis":
 
-        task = tasks.get(
-            chat_id
-        )
+        task = tasks.get(chat_id)
 
         if task and not task.done():
 
             task.cancel()
 
             # Remove immediately.
-            tasks.pop(
-                chat_id,
-                None,
-            )
+            # We intentionally do not await the task here.
+            tasks.pop(chat_id, None)
 
             await query.message.reply_text(
                 "🛑 تم إيقاف التحليل."
@@ -1545,64 +1420,53 @@ async def button_handler(
 
         else:
 
+            tasks.pop(chat_id, None)
+
             await query.message.reply_text(
-                "لا يوجد تحليل يعمل حالياً."
+                "ℹ️ لا يوجد تحليل يعمل حاليًا."
             )
 
-    # =====================================================
+    # --------------------------------------------
     # SUMMARY
-    # =====================================================
+    # --------------------------------------------
 
     elif query.data == "summary":
 
-        total = stats[
-            "trades"
-        ]
+        trades = stats["trades"]
+        wins = stats["wins"]
+        losses = stats["losses"]
+        pnl = stats["pnl"]
 
-        wins = stats[
-            "wins"
-        ]
-
-        losses = stats[
-            "losses"
-        ]
-
-        pnl = stats[
-            "pnl"
-        ]
-
-        if total > 0:
-
-            winrate = (
-                wins / total
+        if trades > 0:
+            win_rate = (
+                wins / trades
             ) * 100
-
         else:
+            win_rate = 0.0
 
-            winrate = 0
+        summary = (
+            "📊 RustyGold Summary\n\n"
+            f"Trades: {trades}\n"
+            f"Wins: {wins}\n"
+            f"Losses: {losses}\n"
+            f"Win Rate: {win_rate:.2f}%\n"
+            f"Simulated PnL: {pnl:+.2f}\n\n"
+            "⚠️ PnL هنا فرق سعري محاكى "
+            "وليس أرباحًا بالدولار.\n"
+            "⚠️ الإحصائيات تُحفظ في الذاكرة "
+            "وتُصفّر عند إعادة تشغيل السيرفر."
+        )
 
         await query.message.reply_text(
-            (
-                "📊 RustyGold Summary\n\n"
-                f"Trades: {total}\n"
-                f"Wins: {wins}\n"
-                f"Losses: {losses}\n"
-                f"Win rate: "
-                f"{winrate:.1f}%\n"
-                f"Simulated PnL: "
-                f"{pnl:+.2f}"
-            )
+            summary
         )
 
 
-# =========================================================
-# FLASK
-# =========================================================
+# ============================================================
+# FLASK HEALTH CHECK
+# ============================================================
 
-flask_app = Flask(__name__)
-
-
-@flask_app.route("/")
+@app.route("/")
 def home():
 
     return "RustyGold is running."
@@ -1610,64 +1474,61 @@ def home():
 
 def run_flask():
 
-    port = int(
-        os.getenv(
-            "PORT",
-            "10000",
+    app.run(
+        host="0.0.0.0",
+        port=int(
+            os.environ.get(
+                "PORT",
+                10000
+            )
         )
     )
 
-    flask_app.run(
-        host="0.0.0.0",
-        port=port,
-    )
 
-
-# =========================================================
+# ============================================================
 # MAIN
-# =========================================================
+# ============================================================
 
 def main():
 
-    # Keep Render web service alive.
-    threading.Thread(
-        target=run_flask,
-        daemon=True,
-    ).start()
+    print("Starting RustyGold...")
 
-    application = (
+    # Render health server
+    flask_thread = threading.Thread(
+        target=run_flask,
+        daemon=True
+    )
+
+    flask_thread.start()
+
+    print("Flask health server started.")
+
+    telegram_app = (
         Application
         .builder()
-        .token(
-            TELEGRAM_TOKEN
-        )
+        .token(TELEGRAM_TOKEN)
         .build()
     )
 
-    application.add_handler(
+    telegram_app.add_handler(
         CommandHandler(
             "start",
-            start,
+            start_command
         )
     )
 
-    application.add_handler(
+    telegram_app.add_handler(
         CallbackQueryHandler(
             button_handler
         )
     )
 
-    print(
-        "RustyGold bot is starting..."
-    )
+    print("Telegram bot starting...")
 
-    application.run_polling()
+    telegram_app.run_polling(
+        drop_pending_updates=True
+    )
 
 
 if __name__ == "__main__":
-
     main()
-
-
-
-
